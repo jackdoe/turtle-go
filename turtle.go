@@ -14,6 +14,8 @@ const FNV_prime = 16777619
 
 type ReadableModel struct {
 	weights        []float32
+	sparse         map[uint32]float32
+	isSparse       bool
 	bits           uint
 	minLabel       float32
 	maxLabel       float32
@@ -40,6 +42,7 @@ func NewReadableModel(r io.Reader) (*ReadableModel, error) {
 		bits:      0,
 		oaa:       1,
 		mask:      0,
+		sparse:    map[uint32]float32{},
 		hashAll:   false,
 		seed:      0,
 		weights:   []float32{},
@@ -47,6 +50,7 @@ func NewReadableModel(r io.Reader) (*ReadableModel, error) {
 	}
 	scanner := bufio.NewScanner(r)
 	inHeader := true
+	nonZero := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -93,6 +97,7 @@ func NewReadableModel(r io.Reader) (*ReadableModel, error) {
 			}
 		} else {
 			m.weights[parseInt(splitted[0])] = parseFloat(splitted[1])
+			nonZero++
 		}
 	}
 
@@ -100,6 +105,15 @@ func NewReadableModel(r io.Reader) (*ReadableModel, error) {
 		return nil, err
 	}
 
+	// random threshold that made sense when i was thinking about it
+	// XXX; do some benchmarks when it makes sense, or make it configurable
+	if nonZero < int(m.mask/8) {
+		m.isSparse = true
+		for i, w := range m.weights {
+			m.sparse[uint32(i)] = w
+		}
+		m.weights = nil
+	}
 	return m, nil
 }
 
@@ -155,7 +169,17 @@ func Identity(a float32) float32 {
 func Logistic(a float32) float32 {
 	return float32((1. / (1. + math.Exp(float64(-a)))))
 }
-
+func (m *ReadableModel) get(bucket uint32) float32 {
+	if m.isSparse {
+		v, ok := m.sparse[bucket]
+		if ok {
+			return v
+		}
+		return 0
+	} else {
+		return m.weights[bucket]
+	}
+}
 func (m *ReadableModel) Predict(req *Request) []float32 {
 	out := make([]float32, m.oaa)
 	for _, ns := range req.Namespaces {
@@ -184,7 +208,7 @@ func (m *ReadableModel) Predict(req *Request) []float32 {
 
 			for klass := uint32(0); klass < m.oaa; klass++ {
 				bucket := m.getBucket(f.hash, klass)
-				out[klass] += f.Value * m.weights[bucket]
+				out[klass] += f.Value * m.get(bucket)
 			}
 
 		}
@@ -206,7 +230,7 @@ func (m *ReadableModel) Predict(req *Request) []float32 {
 									fnv := ((featureA.hash * FNV_prime) ^ featureB.hash)
 									for klass := uint32(0); klass < m.oaa; klass++ {
 										bucket := m.getBucket(fnv, klass)
-										out[klass] += featureA.Value * featureB.Value * m.weights[bucket]
+										out[klass] += featureA.Value * featureB.Value * m.get(bucket)
 									}
 								}
 							}
@@ -219,7 +243,7 @@ func (m *ReadableModel) Predict(req *Request) []float32 {
 
 	for klass := uint32(0); klass < m.oaa; klass++ {
 		bucket := m.getBucket(intercept, klass)
-		out[klass] += m.weights[bucket]
+		out[klass] += m.get(bucket)
 		out[klass] = clipTo(out[klass], m.minLabel, m.maxLabel)
 	}
 	if req.Probabilities {
